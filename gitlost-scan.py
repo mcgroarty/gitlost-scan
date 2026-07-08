@@ -94,6 +94,22 @@ AGENT_CONFIG_PATHS = [
     ".mcp.json",
 ]
 
+GITLOST_FINDING_CATEGORIES = {
+    "gitlost-susceptibility",
+    "workflow-output-sink",
+    "agent-workflow",
+    "workflow-trigger",
+    "agent-config",
+}
+
+GITLOST_CONTEXT_CATEGORIES = {
+    "workflow-permissions",
+    "actions-token",
+    "org-actions-token",
+    "org-secrets",
+    "fork-pr",
+}
+
 OUTPUT_SINK_PATTERNS = [
     (
         "GitHub issue/PR comment command",
@@ -134,6 +150,7 @@ class Finding:
     visibility: str
     archived: bool
     category: str
+    assessment_scope: str
     severity: str
     finding: str
     evidence: str
@@ -555,6 +572,18 @@ def scan_workflow_text(path: str, text: str) -> WorkflowSignals:
     )
 
 
+def assessment_scope_for_category(category: str) -> str:
+    """Classify a finding category by its relationship to the GitLost assessment."""
+
+    if category in GITLOST_FINDING_CATEGORIES:
+        return "gitlost"
+    if category in GITLOST_CONTEXT_CATEGORIES:
+        return "gitlost-context"
+    if category == "coverage":
+        return "coverage"
+    return "general-hygiene"
+
+
 def add_finding(findings: List[Finding], repo: Dict[str, Any], category: str, severity: str, finding: str, evidence: str, suggested_action: str) -> None:
     """Append a normalized finding row for a repository or organization."""
 
@@ -563,6 +592,7 @@ def add_finding(findings: List[Finding], repo: Dict[str, Any], category: str, se
         visibility=repo.get("visibility", ""),
         archived=bool(repo.get("archived", False)),
         category=category,
+        assessment_scope=assessment_scope_for_category(category),
         severity=severity,
         finding=finding,
         evidence=evidence,
@@ -882,7 +912,7 @@ def write_csv(path: str, findings: List[Finding]) -> None:
     """Write findings to CSV, preserving headers even when there are no findings."""
 
     fields = list(asdict(findings[0]).keys()) if findings else [
-        "repo", "visibility", "archived", "category", "severity", "finding", "evidence", "suggested_action"
+        "repo", "visibility", "archived", "category", "assessment_scope", "severity", "finding", "evidence", "suggested_action"
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)

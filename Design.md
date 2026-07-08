@@ -81,6 +81,19 @@ workflow logic before deciding whether a sink can carry agent output.
 
 ## Finding Categories
 
+Every CSV row includes an `assessment_scope` column. The values are:
+
+- `gitlost`: direct evidence for the modeled chain, including
+  `gitlost-susceptibility`, `workflow-output-sink`, `agent-workflow`,
+  `workflow-trigger`, and `agent-config`.
+- `gitlost-context`: findings that can affect exploitability or blast radius but
+  are not themselves the core chain, including workflow permissions, Actions
+  token defaults, org secrets, and fork PR settings.
+- `general-hygiene`: useful adjacent security posture findings that are outside
+  the focused GitLost assessment.
+- `coverage`: API permission or visibility limitations that affect confidence in
+  scan results.
+
 - `gitlost-susceptibility`: correlated public-input to agent/output chain.
 - `workflow-output-sink`: workflow can publish to public or external locations.
 - `agent-workflow`: workflow appears to invoke or configure an AI/agentic tool.

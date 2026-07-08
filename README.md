@@ -50,6 +50,13 @@ and other sensitive metadata.
 
 ## Interpreting Results
 
+The CSV includes an `assessment_scope` column:
+
+- `gitlost`: direct GitLost-chain evidence.
+- `gitlost-context`: settings that affect exploitability or blast radius.
+- `general-hygiene`: adjacent security posture findings.
+- `coverage`: scan coverage or permissions limitations.
+
 - `gitlost-susceptibility`: correlated GitLost-style exposure chain or partial
   chain. Start here.
 - `workflow-output-sink`: a workflow can publish data to comments, artifacts,
