@@ -12,6 +12,7 @@ Requires:
 Example:
   python3 github-gitlost-audit.py --org my-org --enterprise my-enterprise
   python3 github-gitlost-audit.py --org my-org --include-archived
+  python3 github-gitlost-audit.py --org my-org --include-private
   python3 github-gitlost-audit.py --org my-org --out gitlost-audit.csv
 
 Notes:
@@ -811,6 +812,7 @@ def main() -> int:
     parser.add_argument("--org", required=True, help="GitHub org login")
     parser.add_argument("--enterprise", default=None, help="Enterprise slug for manual check text (optional)")
     parser.add_argument("--include-archived", action="store_true", help="Include archived repos")
+    parser.add_argument("--include-private", action="store_true", help="Deep-scan private and internal repos; default is public repos only")
     parser.add_argument("--out", default="gitlost-audit.csv", help="CSV output path")
     args = parser.parse_args()
 
@@ -888,10 +890,19 @@ def main() -> int:
         if repo.get("visibility") == "private" or repo.get("private") is True
     )
 
-    for i, repo in enumerate(repos, 1):
+    scan_repos = []
+    for repo in repos:
         if repo.get("archived") and not args.include_archived:
             continue
-        print(f"[{i}/{len(repos)}] {repo.get('full_name')}", file=sys.stderr)
+        if not args.include_private and not repo_is_public(repo):
+            continue
+        scan_repos.append(repo)
+
+    scope = "all visible repos" if args.include_private else "public repos only"
+    print(f"Deep-scanning {len(scan_repos)} of {len(repos)} repos ({scope}).", file=sys.stderr)
+
+    for i, repo in enumerate(scan_repos, 1):
+        print(f"[{i}/{len(scan_repos)}] {repo.get('full_name')}", file=sys.stderr)
         findings.extend(audit_repo(args.org, repo, org_private_repo_count))
 
     findings.sort(key=lambda f: (severity_rank(f.severity), f.repo, f.category, f.finding))

@@ -44,19 +44,23 @@ context and marks exact private repository reachability as a manual check.
 
 1. Use `gh api` to read organization Actions settings, organization Actions
    secrets, and repository inventory.
-2. For each repository, read Actions settings, default branch protection,
-   rulesets, agent-related files, and workflow files.
-3. Parse workflow YAML with PyYAML when available. Fall back to regex matching
+2. Use the full repository inventory to count visible private repositories for
+   blast-radius context.
+3. By default, deep-scan public repositories only. If `--include-private` is
+   passed, also deep-scan private and internal repositories.
+4. For each repository in deep-scan scope, read Actions settings, default branch
+   protection, rulesets, agent-related files, and workflow files.
+5. Parse workflow YAML with PyYAML when available. Fall back to regex matching
    when PyYAML is missing or parsing fails.
-4. Extract workflow signals:
+6. Extract workflow signals:
    - untrusted public triggers
    - risky triggers
    - AI or coding-agent indicators
    - explicit and write-like token permissions
    - public conversation write permissions
    - output sinks
-5. Emit individual findings for useful raw signals.
-6. Emit a correlated `gitlost-susceptibility` finding when the repo-level
+7. Emit individual findings for useful raw signals.
+8. Emit a correlated `gitlost-susceptibility` finding when the repo-level
    evidence forms a GitLost-style chain or partial chain.
 
 ## Output Sinks

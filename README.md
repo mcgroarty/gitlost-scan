@@ -34,9 +34,14 @@ Useful options:
 
 ```bash
 python3 gitlost-scan.py --org YOUR_ORG --include-archived
+python3 gitlost-scan.py --org YOUR_ORG --include-private
 python3 gitlost-scan.py --org YOUR_ORG --enterprise YOUR_ENTERPRISE
 python3 gitlost-scan.py --org YOUR_ORG --out gitlost-audit.csv
 ```
+
+By default, the scanner inventories all visible repositories for context but
+only deep-scans public repositories. Use `--include-private` to also deep-scan
+private and internal repositories.
 
 The script prints a summary to stdout and writes detailed findings to CSV.
 Generated GitLost CSV reports are ignored by this repository's `.gitignore`
