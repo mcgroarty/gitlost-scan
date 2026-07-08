@@ -128,6 +128,8 @@ OUTPUT_SINK_PATTERNS = [
 
 @dataclass
 class Finding:
+    """One CSV row describing a risk signal or coverage limitation."""
+
     repo: str
     visibility: str
     archived: bool
@@ -140,6 +142,8 @@ class Finding:
 
 @dataclass
 class WorkflowSignals:
+    """Normalized workflow traits used for individual and correlated findings."""
+
     triggers: List[str]
     risky_triggers: List[str]
     untrusted_public_triggers: List[str]
@@ -151,6 +155,8 @@ class WorkflowSignals:
 
 
 def gh_api(endpoint: str, paginate: bool = False, tolerate_404: bool = True) -> Optional[Any]:
+    """Call `gh api` and normalize common empty, denied, and paginated responses."""
+
     cmd = [
         "gh",
         "api",
@@ -167,6 +173,8 @@ def gh_api(endpoint: str, paginate: bool = False, tolerate_404: bool = True) -> 
 
     if proc.returncode != 0:
         err = proc.stderr.strip()
+        # Missing features, disabled products, or insufficient repository access
+        # often show up as 404/403. Keep scanning and surface coverage gaps.
         if tolerate_404 and ("HTTP 404" in err or "Not Found" in err):
             return None
         if tolerate_404 and ("HTTP 403" in err or "Forbidden" in err):
@@ -202,6 +210,8 @@ def gh_api(endpoint: str, paginate: bool = False, tolerate_404: bool = True) -> 
 
 
 def get_org_repos(org: str) -> List[Dict[str, Any]]:
+    """Return all visible repositories so public scan scope can still know private blast radius."""
+
     repos = gh_api(f"/orgs/{org}/repos?type=all&per_page=100", paginate=True)
     if not isinstance(repos, list):
         return []
@@ -209,7 +219,11 @@ def get_org_repos(org: str) -> List[Dict[str, Any]]:
 
 
 def get_org_actions_settings(org: str) -> Dict[str, Any]:
+    """Read organization-level Actions policy and token defaults."""
+
     out = {}
+    # These org settings can make otherwise safe-looking repo workflows risky:
+    # broad action usage, write-default GITHUB_TOKENs, and allowed third-party actions.
     for name, endpoint in [
         ("actions_permissions", f"/orgs/{org}/actions/permissions"),
         ("workflow_permissions", f"/orgs/{org}/actions/permissions/workflow"),
@@ -220,6 +234,8 @@ def get_org_actions_settings(org: str) -> Dict[str, Any]:
 
 
 def get_org_actions_secrets(org: str) -> List[Dict[str, Any]]:
+    """List organization Actions secrets and their repository visibility policy."""
+
     data = gh_api(f"/orgs/{org}/actions/secrets?per_page=100", paginate=True)
     if isinstance(data, list):
         return [s for s in data if isinstance(s, dict) and "name" in s]
@@ -229,11 +245,17 @@ def get_org_actions_secrets(org: str) -> List[Dict[str, Any]]:
 
 
 def get_repo_full(owner: str, repo: str) -> Optional[Dict[str, Any]]:
+    """Fetch detailed repository metadata that is absent from org repo listings."""
+
     return gh_api(f"/repos/{owner}/{repo}")
 
 
 def get_repo_actions(owner: str, repo: str) -> Dict[str, Any]:
+    """Read repository-level Actions policy, token defaults, and fork PR settings."""
+
     out = {}
+    # Fork PR settings are mostly adjacent to GitLost, but they show whether
+    # untrusted contributors can receive write tokens or secrets in Actions.
     for name, endpoint in [
         ("actions_permissions", f"/repos/{owner}/{repo}/actions/permissions"),
         ("workflow_permissions", f"/repos/{owner}/{repo}/actions/permissions/workflow"),
@@ -245,10 +267,14 @@ def get_repo_actions(owner: str, repo: str) -> Dict[str, Any]:
 
 
 def get_branch_protection(owner: str, repo: str, branch: str) -> Optional[Dict[str, Any]]:
+    """Fetch classic branch protection for the default branch when visible."""
+
     return gh_api(f"/repos/{owner}/{repo}/branches/{branch}/protection")
 
 
 def get_repo_rulesets(owner: str, repo: str) -> Optional[List[Dict[str, Any]]]:
+    """Fetch newer GitHub repository rulesets that may replace branch protection."""
+
     data = gh_api(f"/repos/{owner}/{repo}/rulesets?per_page=100", paginate=True)
     if isinstance(data, list):
         return data
@@ -256,6 +282,8 @@ def get_repo_rulesets(owner: str, repo: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def list_workflow_files(owner: str, repo: str, ref: str) -> List[Dict[str, Any]]:
+    """List workflow-like files on the default branch without cloning the repo."""
+
     tree = get_repo_tree(owner, repo, ref)
     out: List[Dict[str, Any]] = []
     for path in sorted(tree):
@@ -268,6 +296,8 @@ def list_workflow_files(owner: str, repo: str, ref: str) -> List[Dict[str, Any]]
 
 
 def read_file_content(owner: str, repo: str, path: str, ref: str) -> Optional[str]:
+    """Read and decode a repository file from the GitHub contents or blob API."""
+
     data = gh_api(f"/repos/{owner}/{repo}/contents/{path}?ref={ref}")
     if not isinstance(data, dict):
         return None
@@ -294,6 +324,8 @@ _tree_cache: Dict[str, Set[str]] = {}
 
 
 def get_repo_tree(owner: str, repo: str, ref: str) -> Set[str]:
+    """Return a cached recursive file path set for one repo/ref."""
+
     key = f"{owner}/{repo}@{ref}"
     if key in _tree_cache:
         return _tree_cache[key]
@@ -309,6 +341,8 @@ def get_repo_tree(owner: str, repo: str, ref: str) -> Set[str]:
 
 
 def path_exists(owner: str, repo: str, path: str, ref: str) -> bool:
+    """Check whether a file or directory exists in the cached repository tree."""
+
     tree = get_repo_tree(owner, repo, ref)
     if not tree:
         return False
@@ -331,6 +365,8 @@ def _extract_yaml_body(path: str, text: str) -> Optional[str]:
 
 
 def _parse_yaml(text: str) -> Optional[Dict[str, Any]]:
+    """Parse YAML into a dict, returning None when PyYAML is unavailable or fails."""
+
     if not HAVE_YAML or yaml is None:
         return None
     try:
@@ -341,6 +377,8 @@ def _parse_yaml(text: str) -> Optional[Dict[str, Any]]:
 
 
 def _extract_triggers(parsed: Dict[str, Any]) -> List[str]:
+    """Return workflow event names from the GitHub Actions `on` key."""
+
     # YAML 1.1 parses the bare key `on` as boolean True.
     if "on" in parsed:
         on = parsed["on"]
@@ -360,9 +398,13 @@ def _extract_triggers(parsed: Dict[str, Any]) -> List[str]:
 
 
 def _collect_permissions(parsed: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Collect top-level and job-level GitHub Actions permission declarations."""
+
     out: List[Tuple[str, str]] = []
 
     def add(scope: str, value: Any) -> None:
+        """Append either shorthand or per-scope permissions to the flat output."""
+
         if isinstance(value, str):
             out.append((scope, value))
         elif isinstance(value, dict):
@@ -380,16 +422,22 @@ def _collect_permissions(parsed: Dict[str, Any]) -> List[Tuple[str, str]]:
 
 
 def _permission_key(scope: str) -> str:
+    """Extract the final permission name from a flattened permission scope."""
+
     if scope == "top":
         return "*"
     return scope.rsplit(".", 1)[-1]
 
 
 def _is_write_like(value: str) -> bool:
+    """Return True for permission values that can mutate GitHub or cloud state."""
+
     return value.lower() in ("write", "admin", "write-all")
 
 
 def _collect_public_write_permissions(perms: List[Tuple[str, str]]) -> List[str]:
+    """Find write permissions for GitHub surfaces that can expose public output."""
+
     out: List[str] = []
     for scope, value in perms:
         if not _is_write_like(value):
@@ -401,6 +449,8 @@ def _collect_public_write_permissions(perms: List[Tuple[str, str]]) -> List[str]
 
 
 def _fallback_triggers(yaml_body: str) -> List[str]:
+    """Best-effort event extraction when PyYAML is missing or parsing fails."""
+
     # Keep fallback parsing deliberately simple: when YAML parsing fails, we only
     # need enough signal to avoid missing obvious event names.
     trigger_names = sorted(RISKY_TRIGGERS | UNTRUSTED_PUBLIC_TRIGGERS)
@@ -430,6 +480,8 @@ def _fallback_triggers(yaml_body: str) -> List[str]:
 
 
 def _fallback_permissions(yaml_body: str) -> List[Tuple[str, str]]:
+    """Best-effort permission extraction scoped to actual `permissions` blocks."""
+
     perms: List[Tuple[str, str]] = []
     lines = yaml_body.splitlines()
     for i, line in enumerate(lines):
@@ -454,6 +506,8 @@ def _fallback_permissions(yaml_body: str) -> List[Tuple[str, str]]:
 
 
 def _detect_output_sinks(text: str) -> List[str]:
+    """Find commands or actions that may publish workflow or agent output."""
+
     sinks = [
         label for label, pattern in OUTPUT_SINK_PATTERNS
         if re.search(pattern, text, re.I)
@@ -462,6 +516,8 @@ def _detect_output_sinks(text: str) -> List[str]:
 
 
 def scan_workflow_text(path: str, text: str) -> WorkflowSignals:
+    """Extract GitLost-relevant signals from one workflow or agentic workflow file."""
+
     yaml_body = _extract_yaml_body(path, text) or ""
     parsed = _parse_yaml(yaml_body) if yaml_body else None
 
@@ -500,6 +556,8 @@ def scan_workflow_text(path: str, text: str) -> WorkflowSignals:
 
 
 def add_finding(findings: List[Finding], repo: Dict[str, Any], category: str, severity: str, finding: str, evidence: str, suggested_action: str) -> None:
+    """Append a normalized finding row for a repository or organization."""
+
     findings.append(Finding(
         repo=repo.get("full_name", repo.get("name", "<org>")),
         visibility=repo.get("visibility", ""),
@@ -513,10 +571,14 @@ def add_finding(findings: List[Finding], repo: Dict[str, Any], category: str, se
 
 
 def repo_is_public(repo: Dict[str, Any]) -> bool:
+    """Return True when GitHub metadata says the repository is public."""
+
     return repo.get("visibility") == "public" or repo.get("private") is False
 
 
 def _sample(values: List[str], limit: int = 5) -> str:
+    """Format a bounded evidence list for compact CSV output."""
+
     if len(values) <= limit:
         return "; ".join(values)
     return "; ".join(values[:limit]) + f"; +{len(values) - limit} more"
@@ -532,6 +594,8 @@ def add_gitlost_correlation_finding(
     output_sink_workflows: List[str],
     public_write_workflows: List[str],
 ) -> None:
+    """Add the repo-level GitLost chain finding when public-input and agent signals align."""
+
     if not repo_is_public(repo):
         return
 
@@ -578,6 +642,8 @@ def add_gitlost_correlation_finding(
 
 
 def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: int) -> List[Finding]:
+    """Audit one repository for GitLost signals and adjacent Actions context."""
+
     findings: List[Finding] = []
     repo_name = repo_summary["name"]
     full = get_repo_full(org, repo_name) or repo_summary
@@ -594,6 +660,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
             "Confirm token has sufficient admin/read permissions."
         )
     elif isinstance(workflow_perm, dict):
+        # `default_workflow_permissions` controls the default GITHUB_TOKEN given
+        # to workflow jobs. Write defaults make accidental public output worse.
         default_perm = workflow_perm.get("default_workflow_permissions")
         can_approve = workflow_perm.get("can_approve_pull_request_reviews")
         if default_perm == "write":
@@ -613,6 +681,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
 
     fork_pr = actions.get("fork_pr")
     if isinstance(fork_pr, dict):
+        # Fork PR settings are most important on public repos: they decide
+        # whether outside contributors can trigger workflows with secrets/tokens.
         if fork_pr.get("send_write_tokens_to_workflows"):
             add_finding(
                 findings, full, "fork-pr", "critical",
@@ -638,6 +708,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
 
     actions_perm = actions.get("actions_permissions")
     if isinstance(actions_perm, dict):
+        # Broad action allowance is a supply-chain signal, not the core GitLost
+        # chain, but it can expand what a compromised workflow may run.
         allowed_actions = actions_perm.get("allowed_actions")
         enabled = actions_perm.get("enabled")
         if enabled is True and allowed_actions in ("all", None):
@@ -649,6 +721,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
             )
 
     sec = full.get("security_and_analysis") or {}
+    # GitHub reports these only when the caller has enough access and the
+    # product/license exists for the repo, so missing values are treated gently.
     secret_scanning = (sec.get("secret_scanning") or {}).get("status")
     push_protection = (sec.get("secret_scanning_push_protection") or {}).get("status")
     advanced_security = (sec.get("advanced_security") or {}).get("status")
@@ -677,6 +751,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
 
     protection = get_branch_protection(org, repo_name, default_branch)
     rulesets = get_repo_rulesets(org, repo_name)
+    # Rulesets are GitHub's newer policy system and may protect branches even
+    # when classic branch protection is absent.
     has_rulesets = bool(rulesets)
     if protection is None and not has_rulesets:
         add_finding(
@@ -688,6 +764,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
 
     agent_config_paths: List[str] = []
     for cfg_path in AGENT_CONFIG_PATHS:
+        # Agent instructions and MCP/Copilot config can influence how an agent
+        # interprets issue text even when the workflow file itself looks generic.
         if path_exists(org, repo_name, cfg_path, default_branch):
             agent_config_paths.append(cfg_path)
             add_finding(
@@ -711,6 +789,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
 
         signals = scan_workflow_text(path, text)
 
+        # Accumulate repo-level evidence so one workflow can provide the public
+        # trigger while another file or config supplies the agent signal.
         if signals.untrusted_public_triggers:
             untrusted_input_workflows.append(f"{path}: {', '.join(signals.untrusted_public_triggers)}")
 
@@ -787,6 +867,8 @@ def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: i
 
 
 def severity_rank(sev: str) -> int:
+    """Map severity names to sort order, with unknown severities last."""
+
     return {
         "critical": 0,
         "high": 1,
@@ -797,6 +879,8 @@ def severity_rank(sev: str) -> int:
 
 
 def write_csv(path: str, findings: List[Finding]) -> None:
+    """Write findings to CSV, preserving headers even when there are no findings."""
+
     fields = list(asdict(findings[0]).keys()) if findings else [
         "repo", "visibility", "archived", "category", "severity", "finding", "evidence", "suggested_action"
     ]
@@ -808,6 +892,8 @@ def write_csv(path: str, findings: List[Finding]) -> None:
 
 
 def main() -> int:
+    """Parse CLI arguments, run the organization scan, and write the report."""
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--org", required=True, help="GitHub org login")
     parser.add_argument("--enterprise", default=None, help="Enterprise slug for manual check text (optional)")
@@ -831,6 +917,8 @@ def main() -> int:
 
     org_workflow_perm = org_actions.get("workflow_permissions")
     if isinstance(org_workflow_perm, dict):
+        # Org defaults can silently apply to many repos, so they are reported
+        # before repo scanning and can explain repeated workflow-token findings.
         if org_workflow_perm.get("default_workflow_permissions") == "write":
             add_finding(
                 findings, org_repo, "org-actions-token", "critical",
@@ -848,6 +936,8 @@ def main() -> int:
 
     org_actions_perm = org_actions.get("actions_permissions")
     if isinstance(org_actions_perm, dict):
+        # This setting controls which marketplace/internal actions workflows may
+        # run. Broad allowance is not GitLost by itself, but it increases drift.
         if org_actions_perm.get("enabled") is True and org_actions_perm.get("allowed_actions") in ("all", None):
             add_finding(
                 findings, org_repo, "org-actions-policy", "high",
@@ -858,6 +948,8 @@ def main() -> int:
 
     selected_actions = org_actions.get("selected_actions")
     if isinstance(selected_actions, dict):
+        # Selected-action policy can still allow broad classes such as all
+        # GitHub-owned or verified actions; record that as review context.
         allowed = selected_actions.get("github_owned_allowed")
         verified = selected_actions.get("verified_allowed")
         patterns = selected_actions.get("patterns_allowed") or []
@@ -871,6 +963,8 @@ def main() -> int:
 
     org_secrets = get_org_actions_secrets(args.org)
     for sec in org_secrets:
+        # Only secret names and visibility policies are available here, never
+        # values. Broad visibility matters when public repos exist in the org.
         visibility = sec.get("visibility")
         if visibility in ("all", "private"):
             add_finding(
@@ -890,6 +984,9 @@ def main() -> int:
         if repo.get("visibility") == "private" or repo.get("private") is True
     )
 
+    # Default deep-scan scope is public repos because GitLost starts from public
+    # attacker-controlled text. Private repo inventory is still counted above so
+    # public findings can show possible private-repo blast radius.
     scan_repos = []
     for repo in repos:
         if repo.get("archived") and not args.include_archived:
