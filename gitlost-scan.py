@@ -48,6 +48,24 @@ RISKY_TRIGGERS = {
     "pull_request_review",
 }
 
+# GitLost is a chain, not a single bad setting: public attacker-controlled
+# text has to reach an agent or workflow that can publish output somewhere.
+UNTRUSTED_PUBLIC_TRIGGERS = {
+    "issues",
+    "issue_comment",
+    "discussion",
+    "discussion_comment",
+    "pull_request",
+    "pull_request_review",
+    "pull_request_target",
+}
+
+PUBLIC_OUTPUT_PERMISSION_SCOPES = {
+    "issues",
+    "pull-requests",
+    "discussions",
+}
+
 AGENTISH_PATTERNS = [
     r"\bcopilot\b",
     r"\bopenai\b",
@@ -75,6 +93,37 @@ AGENT_CONFIG_PATHS = [
     ".mcp.json",
 ]
 
+OUTPUT_SINK_PATTERNS = [
+    (
+        "GitHub issue/PR comment command",
+        r"\bgh\s+(?:issue|pr)\s+comment\b",
+    ),
+    (
+        "GitHub API comment write",
+        r"\b(?:gh\s+api|curl)\b[^\n]*(?:/issues/[^\s\"']+/comments|/pulls/[^\s\"']+/comments)",
+    ),
+    (
+        "github-script comment/review write",
+        r"(?:actions/github-script@|github\.rest\.(?:issues|pulls)\.(?:createComment|createReview|createReviewComment)|github\.(?:issues|pulls)\.(?:createComment|createReview|createReviewComment))",
+    ),
+    (
+        "third-party comment action",
+        r"(?:peter-evans/create-or-update-comment|thollander/actions-comment-pull-request|marocchino/sticky-pull-request-comment|mshick/add-pr-comment|github-comment|comment-pull-request)",
+    ),
+    (
+        "Actions artifact upload",
+        r"\bactions/upload-artifact@",
+    ),
+    (
+        "GitHub step summary or log output",
+        r"\b(?:echo|printf|cat|tee)\b[^\n]*(?:GITHUB_STEP_SUMMARY|github\.event|issue\.body|comment\.body|steps\.)",
+    ),
+    (
+        "webhook or HTTP egress",
+        r"\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|httpie|xh)\b[^\n]*(?:https?://|\$[A-Z0-9_]*(?:WEBHOOK|URL))",
+    ),
+]
+
 
 @dataclass
 class Finding:
@@ -86,6 +135,18 @@ class Finding:
     finding: str
     evidence: str
     suggested_action: str
+
+
+@dataclass
+class WorkflowSignals:
+    triggers: List[str]
+    risky_triggers: List[str]
+    untrusted_public_triggers: List[str]
+    agentish: bool
+    has_explicit_permissions: bool
+    dangerous_permissions: bool
+    public_write_permissions: List[str]
+    output_sinks: List[str]
 
 
 def gh_api(endpoint: str, paginate: bool = False, tolerate_404: bool = True) -> Optional[Any]:
@@ -317,40 +378,124 @@ def _collect_permissions(parsed: Dict[str, Any]) -> List[Tuple[str, str]]:
     return out
 
 
-def scan_workflow_text(path: str, text: str) -> Tuple[List[str], bool, bool, bool]:
+def _permission_key(scope: str) -> str:
+    if scope == "top":
+        return "*"
+    return scope.rsplit(".", 1)[-1]
+
+
+def _is_write_like(value: str) -> bool:
+    return value.lower() in ("write", "admin", "write-all")
+
+
+def _collect_public_write_permissions(perms: List[Tuple[str, str]]) -> List[str]:
+    out: List[str] = []
+    for scope, value in perms:
+        if not _is_write_like(value):
+            continue
+        key = _permission_key(scope)
+        if key in PUBLIC_OUTPUT_PERMISSION_SCOPES or value.lower() == "write-all":
+            out.append(f"{scope}={value}")
+    return sorted(set(out))
+
+
+def _fallback_triggers(yaml_body: str) -> List[str]:
+    # Keep fallback parsing deliberately simple: when YAML parsing fails, we only
+    # need enough signal to avoid missing obvious event names.
+    trigger_names = sorted(RISKY_TRIGGERS | UNTRUSTED_PUBLIC_TRIGGERS)
+    found: Set[str] = set()
+    lines = yaml_body.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)on\s*:\s*(.*?)\s*(?:#.*)?$", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        rest = m.group(2)
+        if rest:
+            for trigger in trigger_names:
+                if re.search(rf"\b{re.escape(trigger)}\b", rest):
+                    found.add(trigger)
+            continue
+        for nested in lines[i + 1:]:
+            if not nested.strip() or nested.lstrip().startswith("#"):
+                continue
+            nested_indent = len(nested) - len(nested.lstrip())
+            if nested_indent <= indent:
+                break
+            for trigger in trigger_names:
+                if re.match(rf"^\s*(?:-\s*)?{re.escape(trigger)}\s*(?::|$)", nested):
+                    found.add(trigger)
+    return sorted(found)
+
+
+def _fallback_permissions(yaml_body: str) -> List[Tuple[str, str]]:
+    perms: List[Tuple[str, str]] = []
+    lines = yaml_body.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)permissions\s*:\s*(.*?)\s*(?:#.*)?$", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        rest = m.group(2).strip()
+        if rest:
+            perms.append(("permissions", rest))
+            continue
+        for nested in lines[i + 1:]:
+            if not nested.strip() or nested.lstrip().startswith("#"):
+                continue
+            nested_indent = len(nested) - len(nested.lstrip())
+            if nested_indent <= indent:
+                break
+            nested_match = re.match(r"^\s*([A-Za-z0-9_-]+)\s*:\s*([A-Za-z-]+)\s*(?:#.*)?$", nested)
+            if nested_match:
+                perms.append((f"permissions.{nested_match.group(1)}", nested_match.group(2)))
+    return perms
+
+
+def _detect_output_sinks(text: str) -> List[str]:
+    sinks = [
+        label for label, pattern in OUTPUT_SINK_PATTERNS
+        if re.search(pattern, text, re.I)
+    ]
+    return sorted(set(sinks))
+
+
+def scan_workflow_text(path: str, text: str) -> WorkflowSignals:
     yaml_body = _extract_yaml_body(path, text) or ""
     parsed = _parse_yaml(yaml_body) if yaml_body else None
 
     if parsed is not None:
         triggers = _extract_triggers(parsed)
         risky = sorted({t for t in triggers if t in RISKY_TRIGGERS})
+        untrusted_public = sorted({t for t in triggers if t in UNTRUSTED_PUBLIC_TRIGGERS})
         perms = _collect_permissions(parsed)
         has_explicit_permissions = bool(perms)
-        dangerous_permissions = False
-        for scope, value in perms:
-            vl = value.lower()
-            if vl in ("write", "admin", "write-all"):
-                dangerous_permissions = True
-                break
+        dangerous_permissions = any(_is_write_like(value) for _, value in perms)
+        public_write_permissions = _collect_public_write_permissions(perms)
     else:
         # Regex fallback when PyYAML is unavailable or YAML fails to parse.
-        risky = sorted([
-            t for t in RISKY_TRIGGERS
-            if re.search(rf"(?m)^\s*{re.escape(t)}\s*:", yaml_body)
-            or re.search(rf"(?m)^\s*on\s*:\s*\[?[^\n]*\b{re.escape(t)}\b", yaml_body)
-            or re.search(rf"(?m)^\s*on\s*:\s*{re.escape(t)}\s*$", yaml_body)
-        ])
-        has_explicit_permissions = bool(re.search(r"(?m)^\s*permissions\s*:", yaml_body))
-        dangerous_permissions = bool(
-            re.search(r"(?m)^\s*(contents|issues|pull-requests|actions|id-token|secrets|attestations|deployments|packages|checks|statuses)\s*:\s*(write|admin)\s*$", yaml_body)
-            or re.search(r"(?m)^\s*permissions\s*:\s*write-all\s*$", yaml_body)
-        )
+        triggers = _fallback_triggers(yaml_body)
+        risky = sorted({t for t in triggers if t in RISKY_TRIGGERS})
+        untrusted_public = sorted({t for t in triggers if t in UNTRUSTED_PUBLIC_TRIGGERS})
+        perms = _fallback_permissions(yaml_body)
+        has_explicit_permissions = bool(perms) or bool(re.search(r"(?m)^\s*permissions\s*:", yaml_body))
+        dangerous_permissions = any(_is_write_like(value) for _, value in perms)
+        public_write_permissions = _collect_public_write_permissions(perms)
 
     # Agentish signals are searched across the whole file (markdown prose
     # in gh-aw workflows is where agent prompts live).
     agentish = any(re.search(p, text, re.I) for p in AGENTISH_PATTERNS)
 
-    return risky, agentish, has_explicit_permissions, dangerous_permissions
+    return WorkflowSignals(
+        triggers=sorted(set(triggers)),
+        risky_triggers=risky,
+        untrusted_public_triggers=untrusted_public,
+        agentish=agentish,
+        has_explicit_permissions=has_explicit_permissions,
+        dangerous_permissions=dangerous_permissions,
+        public_write_permissions=public_write_permissions,
+        output_sinks=_detect_output_sinks(text),
+    )
 
 
 def add_finding(findings: List[Finding], repo: Dict[str, Any], category: str, severity: str, finding: str, evidence: str, suggested_action: str) -> None:
@@ -366,7 +511,72 @@ def add_finding(findings: List[Finding], repo: Dict[str, Any], category: str, se
     ))
 
 
-def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
+def repo_is_public(repo: Dict[str, Any]) -> bool:
+    return repo.get("visibility") == "public" or repo.get("private") is False
+
+
+def _sample(values: List[str], limit: int = 5) -> str:
+    if len(values) <= limit:
+        return "; ".join(values)
+    return "; ".join(values[:limit]) + f"; +{len(values) - limit} more"
+
+
+def add_gitlost_correlation_finding(
+    findings: List[Finding],
+    repo: Dict[str, Any],
+    org_private_repo_count: int,
+    agent_config_paths: List[str],
+    untrusted_input_workflows: List[str],
+    agent_workflows: List[str],
+    output_sink_workflows: List[str],
+    public_write_workflows: List[str],
+) -> None:
+    if not repo_is_public(repo):
+        return
+
+    has_untrusted_input = bool(untrusted_input_workflows)
+    has_agent_signal = bool(agent_config_paths or agent_workflows)
+    has_output_path = bool(output_sink_workflows or public_write_workflows)
+    if not (has_untrusted_input and has_agent_signal):
+        return
+
+    # Public REST data cannot prove Copilot/cloud-agent cross-repo reachability.
+    # Visible private repo count is a blast-radius hint, so the CSV evidence
+    # keeps the exact reachability question explicit for manual follow-up.
+    evidence_parts = [
+        "public_repo=true",
+        f"org_private_repos_visible={org_private_repo_count}",
+        f"untrusted_input={_sample(untrusted_input_workflows)}",
+    ]
+    if agent_workflows:
+        evidence_parts.append(f"agent_workflows={_sample(agent_workflows)}")
+    if agent_config_paths:
+        evidence_parts.append(f"agent_config={_sample(agent_config_paths)}")
+    if output_sink_workflows:
+        evidence_parts.append(f"output_sinks={_sample(output_sink_workflows)}")
+    if public_write_workflows:
+        evidence_parts.append(f"public_write_permissions={_sample(public_write_workflows)}")
+    evidence_parts.append("private_repo_reachability=manual_check_required")
+
+    if has_output_path and org_private_repo_count > 0:
+        severity = "critical"
+        finding = "Likely GitLost-style susceptibility chain in public repository."
+    elif has_output_path:
+        severity = "high"
+        finding = "Public prompt-to-output agent chain present; private repo reachability not confirmed."
+    else:
+        severity = "high"
+        finding = "Partial GitLost-style chain: public untrusted input can reach agent-like behavior, but no output sink was detected."
+
+    add_finding(
+        findings, repo, "gitlost-susceptibility", severity,
+        finding,
+        " | ".join(evidence_parts),
+        "Treat this as a priority manual review. Disable public issue/comment-driven agent entry points, remove public output sinks, restrict agent repository access, and confirm Copilot/agent firewall and allowlist settings."
+    )
+
+
+def audit_repo(org: str, repo_summary: Dict[str, Any], org_private_repo_count: int) -> List[Finding]:
     findings: List[Finding] = []
     repo_name = repo_summary["name"]
     full = get_repo_full(org, repo_name) or repo_summary
@@ -475,14 +685,21 @@ def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
             "Require PRs, reviews, status checks, and CODEOWNERS for default/release branches."
         )
 
+    agent_config_paths: List[str] = []
     for cfg_path in AGENT_CONFIG_PATHS:
         if path_exists(org, repo_name, cfg_path, default_branch):
+            agent_config_paths.append(cfg_path)
             add_finding(
                 findings, full, "agent-config", "medium",
                 "Repository contains agent/coding-assistant configuration.",
                 cfg_path,
                 "Ensure this path is covered by CODEOWNERS and branch/ruleset review requirements."
             )
+
+    untrusted_input_workflows: List[str] = []
+    agent_workflows: List[str] = []
+    output_sink_workflows: List[str] = []
+    public_write_workflows: List[str] = []
 
     workflow_files = list_workflow_files(org, repo_name, default_branch)
     for wf in workflow_files:
@@ -491,26 +708,54 @@ def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
         if not text:
             continue
 
-        risky_triggers, agentish, has_explicit_permissions, dangerous_permissions = scan_workflow_text(path, text)
+        signals = scan_workflow_text(path, text)
 
-        if risky_triggers:
-            severity = "high" if agentish or dangerous_permissions else "medium"
+        if signals.untrusted_public_triggers:
+            untrusted_input_workflows.append(f"{path}: {', '.join(signals.untrusted_public_triggers)}")
+
+        if signals.agentish:
+            agent_workflows.append(path)
+
+        if signals.output_sinks:
+            output_sink_workflows.append(f"{path}: {', '.join(signals.output_sinks)}")
+
+        if signals.public_write_permissions:
+            public_write_workflows.append(f"{path}: {', '.join(signals.public_write_permissions)}")
+
+        if signals.risky_triggers:
+            severity = "high" if signals.agentish or signals.dangerous_permissions else "medium"
             add_finding(
                 findings, full, "workflow-trigger", severity,
                 "Workflow uses triggers that are risky with untrusted user-controlled text.",
-                f"{path}: {', '.join(risky_triggers)}",
+                f"{path}: {', '.join(signals.risky_triggers)}",
                 "Review whether untrusted issues/comments/PR metadata can reach tools, secrets, tokens, shell, or AI agents."
             )
 
-        if agentish:
+        if signals.agentish:
             add_finding(
-                findings, full, "agent-workflow", "high" if risky_triggers else "medium",
+                findings, full, "agent-workflow", "high" if signals.risky_triggers else "medium",
                 "Workflow appears to invoke or configure an AI/agentic tool.",
                 path,
                 "Require security review. Scope token permissions, secrets, repo access, and outbound network behavior."
             )
 
-        if not has_explicit_permissions:
+        if signals.output_sinks:
+            add_finding(
+                findings, full, "workflow-output-sink", "high" if signals.risky_triggers or signals.agentish else "medium",
+                "Workflow has a potential public or external output sink.",
+                f"{path}: {', '.join(signals.output_sinks)}",
+                "Confirm agent output and untrusted input cannot be written to public comments, logs, artifacts, summaries, or external endpoints."
+            )
+
+        if signals.public_write_permissions:
+            add_finding(
+                findings, full, "workflow-output-sink", "high" if signals.risky_triggers or signals.agentish else "medium",
+                "Workflow token can write to public GitHub conversation surfaces.",
+                f"{path}: {', '.join(signals.public_write_permissions)}",
+                "Remove issue, pull request, or discussion write permissions unless a reviewed workflow requires them."
+            )
+
+        if not signals.has_explicit_permissions:
             add_finding(
                 findings, full, "workflow-permissions", "medium",
                 "Workflow does not declare an explicit permissions block.",
@@ -518,13 +763,24 @@ def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
                 "Add least-privilege permissions: at workflow or job level."
             )
 
-        if dangerous_permissions:
+        if signals.dangerous_permissions:
             add_finding(
                 findings, full, "workflow-permissions", "high",
                 "Workflow requests write/admin-like permissions.",
                 path,
                 "Confirm this is necessary. Split jobs or reduce permissions where possible."
             )
+
+    add_gitlost_correlation_finding(
+        findings=findings,
+        repo=full,
+        org_private_repo_count=org_private_repo_count,
+        agent_config_paths=agent_config_paths,
+        untrusted_input_workflows=untrusted_input_workflows,
+        agent_workflows=agent_workflows,
+        output_sink_workflows=output_sink_workflows,
+        public_write_workflows=public_write_workflows,
+    )
 
     return findings
 
@@ -627,11 +883,16 @@ def main() -> int:
         print("No repos found or insufficient access.", file=sys.stderr)
         return 2
 
+    org_private_repo_count = sum(
+        1 for repo in repos
+        if repo.get("visibility") == "private" or repo.get("private") is True
+    )
+
     for i, repo in enumerate(repos, 1):
         if repo.get("archived") and not args.include_archived:
             continue
         print(f"[{i}/{len(repos)}] {repo.get('full_name')}", file=sys.stderr)
-        findings.extend(audit_repo(args.org, repo))
+        findings.extend(audit_repo(args.org, repo, org_private_repo_count))
 
     findings.sort(key=lambda f: (severity_rank(f.severity), f.repo, f.category, f.finding))
 
@@ -665,11 +926,11 @@ def main() -> int:
     print("")
     print("Suggested triage order")
     print("----------------------")
-    print("1. critical and high findings in public repos")
-    print("2. public repos with agent workflows or issue/comment triggers")
-    print("3. repos with org secrets visible broadly")
-    print("4. private repos with read/write default workflow tokens")
-    print("5. repos with missing branch protection/rulesets")
+    print("1. gitlost-susceptibility findings in public repos")
+    print("2. public repos with both agent-workflow and workflow-output-sink findings")
+    print("3. manual Copilot/cloud-agent access and firewall checks for those repos")
+    print("4. workflows with public write permissions or comment/webhook/artifact sinks")
+    print("5. adjacent high/critical Actions token or org-secret findings")
 
     return 0
 

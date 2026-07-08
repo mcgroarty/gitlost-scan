@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GitLost audit outputs may contain private repo names, secret names, and findings.
+gitlost-audit.csv
+gitlost-audit-*.csv
+gitlost-*.csv
