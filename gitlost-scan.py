@@ -17,7 +17,7 @@ Example:
 Notes:
   - This does not modify GitHub settings.
   - It intentionally uses gh api rather than a Python GitHub library.
-  - It uses simple workflow-text scanning, not a full YAML parser.
+  - Prefers PyYAML for workflow parsing; falls back to regex when unavailable.
 """
 
 import argparse
@@ -28,7 +28,14 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    import yaml  # type: ignore
+    HAVE_YAML = True
+except ImportError:
+    yaml = None  # type: ignore[assignment]
+    HAVE_YAML = False
 
 
 RISKY_TRIGGERS = {
@@ -48,10 +55,11 @@ AGENTISH_PATTERNS = [
     r"\bclaude\b",
     r"\bcodex\b",
     r"\bdevin\b",
-    r"\bagent\b",
-    r"\bmcp\b",
-    r"\bllm\b",
-    r"\bai[-_ ]?agent\b",
+    r"\bai[-_ ]?agent(s|ic)?\b",
+    r"\bcoding[-_ ]?agent\b",
+    r"\bmcp[-_ ]?server\b",
+    r"\bactions/ai-inference\b",
+    r"\bgh[-_]aw\b",
 ]
 
 AGENT_CONFIG_PATHS = [
@@ -150,7 +158,9 @@ def get_org_actions_settings(org: str) -> Dict[str, Any]:
 
 
 def get_org_actions_secrets(org: str) -> List[Dict[str, Any]]:
-    data = gh_api(f"/orgs/{org}/actions/secrets?per_page=100", paginate=False)
+    data = gh_api(f"/orgs/{org}/actions/secrets?per_page=100", paginate=True)
+    if isinstance(data, list):
+        return [s for s in data if isinstance(s, dict) and "name" in s]
     if isinstance(data, dict) and isinstance(data.get("secrets"), list):
         return data["secrets"]
     return []
@@ -184,10 +194,15 @@ def get_repo_rulesets(owner: str, repo: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def list_workflow_files(owner: str, repo: str, ref: str) -> List[Dict[str, Any]]:
-    data = gh_api(f"/repos/{owner}/{repo}/contents/.github/workflows?ref={ref}")
-    if isinstance(data, list):
-        return [x for x in data if x.get("type") == "file" and x.get("name", "").lower().endswith((".yml", ".yaml"))]
-    return []
+    tree = get_repo_tree(owner, repo, ref)
+    out: List[Dict[str, Any]] = []
+    for path in sorted(tree):
+        if not path.startswith(".github/workflows/"):
+            continue
+        if not path.lower().endswith((".yml", ".yaml", ".md")):
+            continue
+        out.append({"path": path, "name": path.rsplit("/", 1)[-1]})
+    return out
 
 
 def read_file_content(owner: str, repo: str, path: str, ref: str) -> Optional[str]:
@@ -201,27 +216,139 @@ def read_file_content(owner: str, repo: str, path: str, ref: str) -> Optional[st
             return base64.b64decode(content).decode("utf-8", errors="replace")
         except Exception:
             return None
+    # Files >1 MB: contents API returns no body. Fall back to git blobs.
+    sha = data.get("sha")
+    if sha:
+        blob = gh_api(f"/repos/{owner}/{repo}/git/blobs/{sha}")
+        if isinstance(blob, dict) and blob.get("encoding") == "base64" and blob.get("content"):
+            try:
+                return base64.b64decode(blob["content"]).decode("utf-8", errors="replace")
+            except Exception:
+                return None
     return None
 
 
+_tree_cache: Dict[str, Set[str]] = {}
+
+
+def get_repo_tree(owner: str, repo: str, ref: str) -> Set[str]:
+    key = f"{owner}/{repo}@{ref}"
+    if key in _tree_cache:
+        return _tree_cache[key]
+    data = gh_api(f"/repos/{owner}/{repo}/git/trees/{ref}?recursive=1")
+    paths: Set[str] = set()
+    if isinstance(data, dict) and isinstance(data.get("tree"), list):
+        for entry in data["tree"]:
+            p = entry.get("path")
+            if p:
+                paths.add(p)
+    _tree_cache[key] = paths
+    return paths
+
+
 def path_exists(owner: str, repo: str, path: str, ref: str) -> bool:
-    data = gh_api(f"/repos/{owner}/{repo}/contents/{path}?ref={ref}")
-    return isinstance(data, dict) or isinstance(data, list)
+    tree = get_repo_tree(owner, repo, ref)
+    if not tree:
+        return False
+    if path in tree:
+        return True
+    prefix = path.rstrip("/") + "/"
+    return any(p.startswith(prefix) for p in tree)
 
 
-def scan_workflow_text(text: str) -> Tuple[List[str], bool, bool, bool]:
-    lower = text.lower()
+def _extract_yaml_body(path: str, text: str) -> Optional[str]:
+    """Return the YAML portion of a workflow file.
 
-    risky = sorted([trigger for trigger in RISKY_TRIGGERS if re.search(rf"(^|\s|[\[\{{,]){re.escape(trigger)}(\s|:|,|\]|\}}|$)", lower, re.M)])
+    For .yml/.yaml the whole file is YAML. For .md (gh-aw agentic workflows)
+    the YAML lives in `---`-fenced frontmatter at the top.
+    """
+    if path.lower().endswith(".md"):
+        m = re.match(r"\s*---\s*\n(.*?)\n---\s*(?:\n|$)", text, re.S)
+        return m.group(1) if m else None
+    return text
 
-    agentish = any(re.search(p, lower, re.I) for p in AGENTISH_PATTERNS)
 
-    has_explicit_permissions = bool(re.search(r"(?m)^\s*permissions\s*:", text))
+def _parse_yaml(text: str) -> Optional[Dict[str, Any]]:
+    if not HAVE_YAML or yaml is None:
+        return None
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
-    dangerous_permissions = bool(
-        re.search(r"(?m)^\s*(contents|issues|pull-requests|actions|id-token|secrets|attestations)\s*:\s*(write|admin)\s*$", text)
-        or re.search(r"(?m)^\s*permissions\s*:\s*write-all\s*$", text)
-    )
+
+def _extract_triggers(parsed: Dict[str, Any]) -> List[str]:
+    # YAML 1.1 parses the bare key `on` as boolean True.
+    if "on" in parsed:
+        on = parsed["on"]
+    elif True in parsed:  # type: ignore[operator]
+        on = parsed[True]  # type: ignore[index]
+    else:
+        return []
+    if on is None:
+        return []
+    if isinstance(on, str):
+        return [on]
+    if isinstance(on, list):
+        return [str(x) for x in on if isinstance(x, (str, int))]
+    if isinstance(on, dict):
+        return [str(k) for k in on.keys()]
+    return []
+
+
+def _collect_permissions(parsed: Dict[str, Any]) -> List[Tuple[str, str]]:
+    out: List[Tuple[str, str]] = []
+
+    def add(scope: str, value: Any) -> None:
+        if isinstance(value, str):
+            out.append((scope, value))
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                out.append((f"{scope}.{k}", str(v)))
+
+    if "permissions" in parsed:
+        add("top", parsed.get("permissions"))
+    jobs = parsed.get("jobs")
+    if isinstance(jobs, dict):
+        for jname, jdef in jobs.items():
+            if isinstance(jdef, dict) and "permissions" in jdef:
+                add(f"jobs.{jname}", jdef.get("permissions"))
+    return out
+
+
+def scan_workflow_text(path: str, text: str) -> Tuple[List[str], bool, bool, bool]:
+    yaml_body = _extract_yaml_body(path, text) or ""
+    parsed = _parse_yaml(yaml_body) if yaml_body else None
+
+    if parsed is not None:
+        triggers = _extract_triggers(parsed)
+        risky = sorted({t for t in triggers if t in RISKY_TRIGGERS})
+        perms = _collect_permissions(parsed)
+        has_explicit_permissions = bool(perms)
+        dangerous_permissions = False
+        for scope, value in perms:
+            vl = value.lower()
+            if vl in ("write", "admin", "write-all"):
+                dangerous_permissions = True
+                break
+    else:
+        # Regex fallback when PyYAML is unavailable or YAML fails to parse.
+        risky = sorted([
+            t for t in RISKY_TRIGGERS
+            if re.search(rf"(?m)^\s*{re.escape(t)}\s*:", yaml_body)
+            or re.search(rf"(?m)^\s*on\s*:\s*\[?[^\n]*\b{re.escape(t)}\b", yaml_body)
+            or re.search(rf"(?m)^\s*on\s*:\s*{re.escape(t)}\s*$", yaml_body)
+        ])
+        has_explicit_permissions = bool(re.search(r"(?m)^\s*permissions\s*:", yaml_body))
+        dangerous_permissions = bool(
+            re.search(r"(?m)^\s*(contents|issues|pull-requests|actions|id-token|secrets|attestations|deployments|packages|checks|statuses)\s*:\s*(write|admin)\s*$", yaml_body)
+            or re.search(r"(?m)^\s*permissions\s*:\s*write-all\s*$", yaml_body)
+        )
+
+    # Agentish signals are searched across the whole file (markdown prose
+    # in gh-aw workflows is where agent prompts live).
+    agentish = any(re.search(p, text, re.I) for p in AGENTISH_PATTERNS)
 
     return risky, agentish, has_explicit_permissions, dangerous_permissions
 
@@ -248,7 +375,14 @@ def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
     actions = get_repo_actions(org, repo_name)
 
     workflow_perm = actions.get("workflow_permissions")
-    if isinstance(workflow_perm, dict):
+    if isinstance(workflow_perm, dict) and "__error__" in workflow_perm:
+        add_finding(
+            findings, full, "coverage", "info",
+            "Could not read repository workflow permissions.",
+            workflow_perm["__error__"],
+            "Confirm token has sufficient admin/read permissions."
+        )
+    elif isinstance(workflow_perm, dict):
         default_perm = workflow_perm.get("default_workflow_permissions")
         can_approve = workflow_perm.get("can_approve_pull_request_reviews")
         if default_perm == "write":
@@ -265,13 +399,6 @@ def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
                 json.dumps(workflow_perm, sort_keys=True),
                 "Disable Actions PR approval unless explicitly required and separately controlled."
             )
-    elif isinstance(workflow_perm, dict) and "__error__" in workflow_perm:
-        add_finding(
-            findings, full, "coverage", "info",
-            "Could not read repository workflow permissions.",
-            workflow_perm["__error__"],
-            "Confirm token has sufficient admin/read permissions."
-        )
 
     fork_pr = actions.get("fork_pr")
     if isinstance(fork_pr, dict):
@@ -364,7 +491,7 @@ def audit_repo(org: str, repo_summary: Dict[str, Any]) -> List[Finding]:
         if not text:
             continue
 
-        risky_triggers, agentish, has_explicit_permissions, dangerous_permissions = scan_workflow_text(text)
+        risky_triggers, agentish, has_explicit_permissions, dangerous_permissions = scan_workflow_text(path, text)
 
         if risky_triggers:
             severity = "high" if agentish or dangerous_permissions else "medium"
